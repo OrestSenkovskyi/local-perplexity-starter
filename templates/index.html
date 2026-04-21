@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Perplexity</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f1117;
+      color: #e8e8e8;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    /* ── Header ── */
+    #header {
+      width: 100%;
+      max-width: 760px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.25rem 1rem 0.75rem;
+      flex-shrink: 0;
+    }
+
+    #header h1 {
+      font-size: 1.4rem;
+      font-weight: 600;
+      color: #a78bfa;
+    }
+
+    #new-chat-btn {
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      border: 1px solid #3b3b52;
+      background: transparent;
+      color: #9ca3af;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    #new-chat-btn:hover { border-color: #7c3aed; color: #a78bfa; }
+
+    /* ── Messages ── */
+    #messages {
+      width: 100%;
+      max-width: 760px;
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.5rem 1rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    /* Empty state */
+    #empty-state {
+      margin: auto;
+      text-align: center;
+      color: #4b5563;
+    }
+    #empty-state p { font-size: 0.95rem; margin-top: 0.5rem; }
+
+    /* User bubble */
+    .msg-user {
+      align-self: flex-end;
+      max-width: 75%;
+      background: #2d1f5e;
+      border: 1px solid #4c3585;
+      border-radius: 14px 14px 4px 14px;
+      padding: 0.7rem 1rem;
+      font-size: 0.95rem;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    /* Assistant block */
+    .msg-assistant {
+      align-self: flex-start;
+      width: 100%;
+    }
+
+    .msg-assistant .meta {
+      font-size: 0.75rem;
+      color: #6b7280;
+      margin-bottom: 0.5rem;
+    }
+
+    .msg-assistant .answer-text {
+      background: #1a1a2e;
+      border: 1px solid #2e2e3a;
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.95rem;
+    }
+
+    /* Thinking placeholder */
+    .msg-assistant.thinking .answer-text {
+      color: #6b7280;
+    }
+
+    /* Sources */
+    .sources-section { margin-top: 0.75rem; }
+
+    .sources-section h3 {
+      font-size: 0.78rem;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.4rem;
+    }
+
+    .source-item {
+      padding: 0.45rem 0;
+      border-top: 1px solid #2e2e3a;
+      font-size: 0.85rem;
+    }
+    .source-item:first-child { border-top: none; }
+
+    .source-num {
+      display: inline-block;
+      background: #7c3aed33;
+      color: #a78bfa;
+      border-radius: 4px;
+      padding: 0 5px;
+      font-size: 0.72rem;
+      margin-right: 0.35rem;
+    }
+
+    .source-item a { color: #60a5fa; text-decoration: none; }
+    .source-item a:hover { text-decoration: underline; }
+
+    .source-snippet {
+      color: #9ca3af;
+      margin-top: 0.15rem;
+      font-size: 0.8rem;
+      line-height: 1.45;
+    }
+
+    /* ── Input bar ── */
+    #input-bar {
+      width: 100%;
+      max-width: 760px;
+      padding: 0.75rem 1rem 1.25rem;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    #input-row {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    #question {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      border: 1px solid #2e2e3a;
+      background: #1a1a2e;
+      color: #e8e8e8;
+      font-size: 1rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    #question:focus { border-color: #7c3aed; }
+
+    #send-btn {
+      padding: 0.75rem 1.25rem;
+      border-radius: 8px;
+      border: none;
+      background: #7c3aed;
+      color: #fff;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    #send-btn:hover:not(:disabled) { background: #6d28d9; }
+    #send-btn:disabled { background: #4b5563; cursor: not-allowed; }
+
+    #controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    #force-search-label {
+      font-size: 0.83rem;
+      color: #9ca3af;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      user-select: none;
+      cursor: pointer;
+    }
+
+    #error-msg {
+      font-size: 0.85rem;
+      color: #f87171;
+    }
+
+    /* Spinner */
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid #4b5563;
+      border-top-color: #a78bfa;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 0.35rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <div id="header">
+    <h1>🔍 Local Perplexity</h1>
+    <button id="new-chat-btn" onclick="newChat()">＋ New chat</button>
+  </div>
+
+  <div id="messages">
+    <div id="empty-state">
+      <p>Ask anything to start a conversation.</p>
+    </div>
+  </div>
+
+  <div id="input-bar">
+    <div id="input-row">
+      <input id="question" type="text" placeholder="Ask anything…" autocomplete="off" />
+      <button id="send-btn" onclick="sendMessage()">Ask</button>
+    </div>
+    <div id="controls">
+      <label id="force-search-label">
+        <input id="force-search" type="checkbox" />
+        Always search the web
+      </label>
+      <span id="error-msg"></span>
+    </div>
+  </div>
+
+  <script>
+    const questionEl  = document.getElementById('question');
+    const sendBtn     = document.getElementById('send-btn');
+    const messagesEl  = document.getElementById('messages');
+    const emptyState  = document.getElementById('empty-state');
+    const errorMsg    = document.getElementById('error-msg');
+    const forceSearch = document.getElementById('force-search');
+
+    // Conversation history sent to the backend with each request.
+    // Each entry: { role: 'user'|'assistant', content: string }
+    let history = [];
+
+    questionEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+
+    function newChat() {
+      history = [];
+      messagesEl.innerHTML = '';
+      messagesEl.appendChild(emptyState);
+      emptyState.style.display = '';
+      errorMsg.textContent = '';
+      questionEl.value = '';
+      questionEl.focus();
+    }
+
+    async function sendMessage() {
+      const message = questionEl.value.trim();
+      if (!message) return;
+
+      errorMsg.textContent = '';
+      emptyState.style.display = 'none';
+      questionEl.value = '';
+      sendBtn.disabled = true;
+      sendBtn.innerHTML = '<span class="spinner"></span>Thinking…';
+
+      // Append user bubble
+      appendUserBubble(message);
+
+      // Append thinking placeholder
+      const assistantEl = appendAssistantPlaceholder();
+
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message,
+            force_search: forceSearch.checked,
+            history,          // send accumulated history
+          }),
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(err.detail || res.statusText);
+        }
+
+        const data = await res.json();
+
+        // Update history with the completed turn
+        history.push({ role: 'user',      content: message });
+        history.push({ role: 'assistant', content: data.answer });
+
+        renderAssistantResponse(assistantEl, data);
+      } catch (err) {
+        assistantEl.remove();
+        errorMsg.textContent = '⚠ ' + err.message;
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Ask';
+        questionEl.focus();
+      }
+    }
+
+    /* ── DOM helpers ── */
+
+    function appendUserBubble(text) {
+      const div = document.createElement('div');
+      div.className = 'msg-user';
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      scrollToBottom();
+    }
+
+    function appendAssistantPlaceholder() {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg-assistant thinking';
+      wrap.innerHTML = `
+        <div class="meta"></div>
+        <div class="answer-text"><span class="spinner"></span>Thinking…</div>`;
+      messagesEl.appendChild(wrap);
+      scrollToBottom();
+      return wrap;
+    }
+
+    function renderAssistantResponse(wrap, data) {
+      wrap.classList.remove('thinking');
+
+      const meta = data.searched && data.query
+        ? `🌐 Searched: "${escHtml(data.query)}" · ${data.sources.length} source(s)`
+        : '💡 Answered from model knowledge (no web search)';
+
+      let sourcesHtml = '';
+      if (data.sources && data.sources.length > 0) {
+        const items = data.sources.map((s, i) => `
+          <div class="source-item">
+            <span class="source-num">${i + 1}</span>
+            <a href="${escHtml(s.url)}" target="_blank" rel="noopener">${escHtml(s.title)}</a>
+            <p class="source-snippet">${escHtml(s.snippet)}</p>
+          </div>`).join('');
+        sourcesHtml = `<div class="sources-section"><h3>Sources</h3>${items}</div>`;
+      }
+
+      wrap.innerHTML = `
+        <div class="meta">${meta}</div>
+        <div class="answer-text">${escHtml(data.answer)}</div>
+        ${sourcesHtml}`;
+
+      scrollToBottom();
+    }
+
+    function scrollToBottom() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function escHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+  </script>
+</body>
+</html>
