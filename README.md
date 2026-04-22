@@ -6,33 +6,108 @@ A self-hosted Perplexity-style search assistant built on top of **LM Studio** (l
 
 - Runs entirely locally — no OpenAI, no paid APIs.
 - Connects to any LM Studio model via the OpenAI-compatible API.
-- Automatically decides whether a question needs a web search (router stage).
-- Searches the web for free using the `duckduckgo-search` library.
+- **Multi-stage pipeline** with automatic search routing, query rewriting, full-page extraction, and grounded two-stage answering.
+- **Prompts tuned for small local models** (3–8B parameters): mechanical, example-rich, and constraint-heavy.
 - Returns answers with numbered citations `[1]`, `[2]`, etc.
+- Per-stage timings in every response for easy profiling.
+- In-memory TTL cache for repeat questions.
+- `/health` endpoint for readiness probes.
 - Simple dark-themed web UI and a plain JSON REST API.
-- Good starting point for extending with RAG, streaming, chat history, or reranking.
 
-## How it works
+## Pipeline architecture
 
-Every request goes through a three-stage pipeline:
+Every `/chat` request flows through a configurable pipeline:
 
-1. **Router** — a cheap LLM call decides whether a web search is needed and, if so, what query to use. Returns `{"need_search": true/false, "query": "..."}`. Skipped entirely when `force_search` is set.
-2. **Search** — calls DuckDuckGo and returns up to `SEARCH_MAX_RESULTS` deduplicated results as `{title, url, snippet}` objects.
-3. **Answer** — the LLM generates a final response using the search snippets as context, citing sources by number.
+```text
+user question
+    │
+    ▼
+┌─────────────┐ trivial? (greeting, "ok", < 4 chars)
+│ Fast-path   │──────────────► offline answer
+└─────────────┘
+    │ otherwise
+    ▼
+┌─────────────┐ temperature=0.0, max_tokens=80
+│ Router LLM  │ returns {"need_search": bool, "query": "..."}
+└─────────────┘
+    │ need_search=false ──────► offline answer
+    │ need_search=true
+    ▼
+┌─────────────┐ DuckDuckGo + tenacity retry (2 attempts, 0.5s backoff)
+│ Search      │ k = SEARCH_MAX_RESULTS
+└─────────────┘
+    │
+    ▼
+┌─────────────┐ if len(results) < 2 and ENABLE_QUERY_REWRITE
+│ Rewrite LLM │ rewrite query with REWRITE_SYSTEM prompt, re-search
+└─────────────┘
+    │
+    ▼
+┌─────────────┐ if ENABLE_PAGE_FETCH
+│ Enrich      │ fetch top PAGE_FETCH_TOP_K URLs in parallel,
+│             │ extract article text with trafilatura (5s timeout)
+└─────────────┘
+    │
+    ▼
+┌─────────────┐ if ENABLE_FACTSHEET (two-stage answer)
+│ Factsheet   │ LLM extracts "- [n] fact" bullets with temperature=0.1
+│ LLM         │
+└─────────────┘
+    │
+    ▼
+┌─────────────┐ temperature=0.2, top_p=0.9, max_tokens=800
+│ Answer LLM  │ uses ANSWER_SYSTEM_GROUNDED + factsheet OR sources
+└─────────────┘
+    │
+    ▼
+response: {answer, sources, searched, query, cached, timings}
+```
+
+### Stage details
+
+| Stage | When it runs | Prompt | Sampling |
+|---|---|---|---|
+| **Fast-path** | Greetings, short messages | — | — |
+| **Router** | Non-trivial questions, `force_search=false` | `ROUTER_SYSTEM` | `T=0.0`, `max_tokens=80` |
+| **Search** | `need_search=true` | — | — |
+| **Query rewrite** | `<2` results and `ENABLE_QUERY_REWRITE` | `REWRITE_SYSTEM` | `T=0.2`, `max_tokens=30` |
+| **Enrich** | `ENABLE_PAGE_FETCH` and sources present | — | — |
+| **Factsheet** | `ENABLE_FACTSHEET` and sources present | `FACTSHEET_SYSTEM` | `T=0.1`, `top_p=0.9`, `max_tokens=600` |
+| **Answer (grounded)** | Sources present | `ANSWER_SYSTEM_GROUNDED` | `T=0.2`, `top_p=0.9`, `max_tokens=800` |
+| **Answer (offline)** | No sources / router said no | `ANSWER_SYSTEM_OFFLINE` | `T=0.4`, `top_p=0.9`, `max_tokens=600` |
+
+### Prompts
+
+All prompts live in `app/prompts.py`:
+
+- **`ROUTER_SYSTEM`** — strict binary router; returns JSON only; 5 worked in/out examples.
+- **`REWRITE_SYSTEM`** — rewrites a failing query into keyword-phrased, time-bounded form.
+- **`FACTSHEET_SYSTEM`** — extracts one `[n]` bullet per fact from search results. Used as first stage of two-stage answer.
+- **`ANSWER_SYSTEM_GROUNDED`** — 9 explicit rules: cite immediately after each claim, never cite missing numbers, copy numbers verbatim, refuse when context is missing.
+- **`ANSWER_SYSTEM_OFFLINE`** — answers from general knowledge; explicit refusal phrase for time-sensitive questions.
+
+The assistant history is trimmed to the last `MAX_HISTORY_TURNS` exchanges, and `[n]` citation markers are stripped from prior assistant turns so old numbers don't leak into new answers.
 
 ## Project structure
 
 ```text
 local-perplexity-starter/
-├── .env.example        # Configuration template
+├── .env.example
 ├── requirements.txt
 ├── app/
 │   ├── config.py       # Settings loaded from .env
-│   ├── main.py         # FastAPI app and pipeline logic
-│   ├── prompts.py      # Router and answer prompt builders
-│   └── search.py       # DuckDuckGo search wrapper
-└── templates/
-    └── index.html      # Single-page web UI
+│   ├── main.py         # FastAPI app + pipeline orchestration
+│   ├── prompts.py      # Prompt templates + message builders
+│   ├── search.py       # DuckDuckGo wrapper with retry
+│   └── fetch.py        # Full-page extraction (httpx + trafilatura)
+├── templates/
+│   └── index.html      # Single-page web UI
+└── tests/
+    ├── test_prompts.py
+    ├── test_main_helpers.py
+    ├── test_search.py
+    ├── test_fetch.py
+    └── test_chat_integration.py
 ```
 
 ## Prerequisites
@@ -45,10 +120,10 @@ local-perplexity-starter/
 
 ### 1. Start LM Studio
 
-1. Open LM Studio and download a model (e.g. Gemma 4 e2b).
+1. Open LM Studio and download a model.
 2. Go to the **Developer** (or **Local Server**) tab.
 3. Click **Start Server**.
-4. Confirm the server is available at `http://localhost:1234/v1`. If your port differs, update `LM_STUDIO_BASE_URL` in `.env`.
+4. Confirm the server is available at `http://localhost:1234/v1`.
 
 ### 2. Install dependencies
 
@@ -72,27 +147,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` as needed:
-
-```env
-# LM Studio
-LM_STUDIO_BASE_URL=http://localhost:1234/v1
-LM_STUDIO_API_KEY=lm-studio      # dummy value, LM Studio does not validate it
-LM_STUDIO_MODEL=                  # leave blank to auto-detect the first loaded model
-
-# Server
-APP_HOST=127.0.0.1
-APP_PORT=8000
-
-# Search
-SEARCH_REGION=wt-wt              # neutral global region; use e.g. us-en for US results
-SEARCH_SAFESEARCH=moderate
-SEARCH_MAX_RESULTS=6
-SEARCH_BACKEND=html              # most stable backend; try "lite" if results are scarce
-
-# Response language (en, uk, de, fr, pl, ru)
-SYSTEM_LANGUAGE=en
-```
+Edit `.env` to taste. See the **Configuration reference** table below for every knob.
 
 ### 4. Run the server
 
@@ -106,46 +161,37 @@ Open `http://127.0.0.1:8000` in your browser.
 
 ### Web UI
 
-Type a question in the input field and press **Ask** or hit Enter. Check **Always search the web** to bypass the router and always fetch fresh results.
+Type a question and press **Ask** or Enter. Check **Always search the web** to bypass the router and force a web search.
 
 ### REST API
 
-**Endpoint:** `POST /chat`
+#### `POST /chat`
 
-**Request body:**
+Request body:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `message` | string | yes | The user's question |
 | `force_search` | boolean | no | Skip the router and always run a web search (default: `false`) |
+| `history` | array | no | Prior `{role, content}` turns to include as conversation context |
 
-**Response body:**
+Response body:
 
 | Field | Type | Description |
 |---|---|---|
 | `answer` | string | LLM-generated answer, may contain `[n]` citation markers |
-| `sources` | array | List of `{title, url, snippet}` objects used as context |
+| `sources` | array | `[{title, url, snippet}]` used as context |
 | `searched` | boolean | Whether a web search was performed |
-| `query` | string \| null | The search query sent to DuckDuckGo, or `null` if no search |
+| `query` | string \| null | The search query actually used, or `null` |
+| `cached` | boolean | `true` if this response was served from the in-memory cache |
+| `timings` | object | `{router_ms, search_ms, rewrite_ms, fetch_ms, factsheet_ms, answer_ms, total_ms}` |
 
-#### Example 1 — general knowledge question (no web search)
+#### `GET /health`
 
-```bash
-curl -s -X POST http://127.0.0.1:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What is 2 + 2?"}'
-```
+Returns `{status, model, lm_studio_reachable, uptime_seconds}`.
+Useful for container liveness probes.
 
-```json
-{
-  "answer": "2 + 2 equals 4.",
-  "sources": [],
-  "searched": false,
-  "query": null
-}
-```
-
-#### Example 2 — question that triggers automatic web search
+#### Example — automatic web search
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/chat \
@@ -155,25 +201,22 @@ curl -s -X POST http://127.0.0.1:8000/chat \
 
 ```json
 {
-  "answer": "The latest stable Python release is **Python 3.14**, released on October 7, 2025 [4]. The main development branch is already targeting Python 3.15 [1]. For the full list of supported versions and their end-of-life dates, see the official download page [6].",
-  "sources": [
-    {"title": "Status of Python versions", "url": "https://devguide.python.org/versions/", "snippet": "..."},
-    ...
-  ],
+  "answer": "The latest stable Python release is **Python 3.14** [1].",
+  "sources": [{"title": "Python downloads", "url": "https://python.org/downloads", "snippet": "..."}],
   "searched": true,
-  "query": "latest stable Python version"
+  "query": "latest Python stable version",
+  "cached": false,
+  "timings": {
+    "router_ms": 410,
+    "search_ms": 820,
+    "rewrite_ms": 0,
+    "fetch_ms": 1340,
+    "factsheet_ms": 980,
+    "answer_ms": 2150,
+    "total_ms": 5700
+  }
 }
 ```
-
-#### Example 3 — force a web search regardless of the router decision
-
-```bash
-curl -s -X POST http://127.0.0.1:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Current Bitcoin price", "force_search": true}'
-```
-
-`force_search` is useful for news, prices, library versions, and any other rapidly changing information.
 
 ## Configuration reference
 
@@ -181,38 +224,67 @@ curl -s -X POST http://127.0.0.1:8000/chat \
 |---|---|---|
 | `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | Base URL of the LM Studio local server |
 | `LM_STUDIO_API_KEY` | `lm-studio` | API key sent in requests (LM Studio ignores it) |
-| `LM_STUDIO_MODEL` | _(empty)_ | Model ID to use; auto-detects first available model when blank |
-| `APP_HOST` | `127.0.0.1` | Host the FastAPI server binds to |
-| `APP_PORT` | `8000` | Port the FastAPI server listens on |
-| `SEARCH_REGION` | `wt-wt` | DuckDuckGo region code (`wt-wt` = worldwide) |
-| `SEARCH_SAFESEARCH` | `moderate` | SafeSearch setting: `on`, `moderate`, or `off` |
-| `SEARCH_MAX_RESULTS` | `6` | Maximum number of search results to fetch |
-| `SEARCH_BACKEND` | `html` | DuckDuckGo backend: `html` (most stable) or `lite` |
-| `SYSTEM_LANGUAGE` | `uk` | Language for LLM responses: `en`, `uk`, `de`, `fr`, `pl`, `ru` |
+| `LM_STUDIO_MODEL` | _(empty)_ | Model ID; auto-detects the first available model when blank |
+| `APP_HOST` | `127.0.0.1` | FastAPI bind host |
+| `APP_PORT` | `8000` | FastAPI bind port |
+| `SEARCH_REGION` | `wt-wt` | DuckDuckGo region (`wt-wt` = worldwide) |
+| `SEARCH_SAFESEARCH` | `moderate` | `on`, `moderate`, or `off` |
+| `SEARCH_MAX_RESULTS` | `6` | Max results fetched per search |
+| `SEARCH_BACKEND` | `html` | DuckDuckGo backend: `html` (stable) or `lite` |
+| `SYSTEM_LANGUAGE` | `en` | Response language: `en`, `uk`, `de`, `fr`, `pl`, `ru` |
+| `LLM_TIMEOUT` | `60` | Seconds before an LLM call times out |
+| `LLM_RETRIES` | `1` | Extra attempts on LLM failure (total = retries + 1) |
+| `ENABLE_FACTSHEET` | `true` | Enable two-stage answer (factsheet then answer) |
+| `ENABLE_QUERY_REWRITE` | `true` | Retry with a rewritten query if <2 results |
+| `ENABLE_PAGE_FETCH` | `true` | Enrich top-K sources with full-page extraction |
+| `PAGE_FETCH_TOP_K` | `3` | Number of top sources to enrich |
+| `PAGE_FETCH_TIMEOUT` | `5` | Seconds per page fetch |
+| `MAX_HISTORY_TURNS` | `6` | Max prior exchanges included in answer prompt |
+| `CACHE_TTL` | `300` | TTL (seconds) for the answer cache |
+| `CACHE_SIZE` | `128` | Max entries in the answer cache |
+
+## Testing
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+The suite (33 tests, ~1.5 s) covers:
+
+- Prompt builders and helper functions
+- Router JSON parsing (plain, fenced, noisy, invalid)
+- Fast-path detection and cache key derivation
+- Search normalization, deduplication, and retry behaviour
+- Page-fetch fallback when `trafilatura` is unavailable
+- End-to-end `/chat` flow for all pipeline branches (fast-path, router-no-search, router-triggers-search, force_search, cache hit) with a stubbed LLM
+
+No real LLM or network is hit during tests.
 
 ## Troubleshooting
 
 **`503 LLM client not initialised` or `No models found`**
-LM Studio is not running or no model is loaded. Start the server and ensure at least one model is loaded.
+LM Studio is not running or no model is loaded.
 
 **DuckDuckGo returns few or no results**
-Try setting `SEARCH_BACKEND=lite` or increasing `SEARCH_MAX_RESULTS`. If the router generates overly long queries, tighten the `ROUTER_SYSTEM` prompt in `app/prompts.py` to produce shorter queries.
+Leave `ENABLE_QUERY_REWRITE=true` — the pipeline will rewrite and retry automatically. If that still fails, try `SEARCH_BACKEND=lite` or raise `SEARCH_MAX_RESULTS`.
 
-**Router always searches (or never searches)**
-Adjust the `ROUTER_SYSTEM` prompt in `app/prompts.py`, or use `force_search=true` in the request to bypass the router entirely.
+**Router always (or never) searches**
+Adjust `ROUTER_SYSTEM` in `app/prompts.py` or send `force_search=true` in the request.
 
-**Answer quality is poor**
-Lower the model temperature (currently `0.3` for the answer stage). For Gemma-class models, values between `0.1` and `0.2` tend to reduce hallucinations. You can also make the answer prompt stricter: add "Do not use any knowledge outside the provided search results."
+**Answer quality is poor on a small model**
+Lower `temperature` in `app/main.py` (currently `0.2` for grounded answers). Ensure `ENABLE_FACTSHEET=true` — the two-stage split is specifically designed to keep small models faithful to sources.
+
+**Answers are too slow**
+Inspect the per-stage `timings` in the response. The usual suspects are:
+- `fetch_ms` high → reduce `PAGE_FETCH_TOP_K` or disable `ENABLE_PAGE_FETCH`.
+- `factsheet_ms` high → disable `ENABLE_FACTSHEET`.
+- `answer_ms` high → lower `max_tokens` in `_llm_call` or use a smaller model.
 
 ## Extending the project
 
-Suggested next steps:
-
-1. **Streaming** — stream the answer token-by-token via SSE or WebSocket.
-2. **Chat history** — pass recent turns to the LLM for multi-turn conversations.
-3. **Full-page fetch** — retrieve full page content instead of snippets for higher-quality answers.
-4. **Two-stage answer generation** — first summarise search results into a factsheet, then write the final answer from the factsheet (improves consistency on smaller models).
-5. **News mode** — add a separate `DDGS().news(...)` search path for time-sensitive queries.
-6. **Reranking** — score and reorder search results before passing them to the LLM.
-7. **Dockerfile** — containerise the app for easier deployment.
-8. **Tests** — add pytest coverage for the router parsing logic and search module.
+1. **Streaming** — stream the answer via SSE or WebSocket.
+2. **Reranking** — cross-encoder (e.g. `bge-reranker-base`) between search and enrich.
+3. **News mode** — separate `DDGS().news(...)` path for time-sensitive queries.
+4. **Dockerfile** — containerize the app (LM Studio stays on the host).
+5. **Persistent chat history** — SQLite + session IDs.
