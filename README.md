@@ -1,143 +1,154 @@
 # Local Perplexity Starter
 
-A self-hosted Perplexity-style search assistant built on top of **LM Studio** (local LLM) and **DuckDuckGo** (free web search). No cloud APIs or paid subscriptions required.
+A self-hosted [Perplexity AI](https://www.perplexity.ai)-style search assistant that runs entirely on your machine.
+It wires together **LM Studio** (any local instruction-following model) and **DuckDuckGo** (free web search) into a
+multi-stage pipeline that routes questions, fetches and enriches sources, and returns grounded answers with numbered
+citations — no cloud APIs, no paid subscriptions.
+
+---
 
 ## Features
 
-- Runs entirely locally — no OpenAI, no paid APIs.
-- Connects to any LM Studio model via the OpenAI-compatible API.
-- **Multi-stage pipeline** with automatic search routing, query rewriting, full-page extraction, and grounded two-stage answering.
-- **Prompts tuned for small local models** (3–8B parameters): mechanical, example-rich, and constraint-heavy.
-- Returns answers with numbered citations `[1]`, `[2]`, etc.
-- Per-stage timings in every response for easy profiling.
-- In-memory TTL cache for repeat questions.
-- `/health` endpoint for readiness probes.
-- Simple dark-themed web UI and a plain JSON REST API.
+- **Fully local** — LM Studio runs the model; DuckDuckGo provides free search results.
+- **Multi-stage pipeline** — fast-path → router → search → query-rewrite → page-enrich → factsheet → answer.
+- **Prompts tuned for small models** (3–8 B parameters): mechanical, example-rich, constraint-heavy.
+- **Grounded citations** — every factual claim is cited `[1]`, `[2]`, etc., and sources are rendered in the UI.
+- **Two-stage answer generation** — a factsheet extraction pass followed by a grounded answer pass; keeps small
+  models faithful to sources.
+- **Full-page extraction** — fetches article text from the top-K URLs via `trafilatura` for richer context.
+- **Query-rewrite retry** — if the first search returns < 2 results, the model rewrites the query and retries.
+- **Conversation history** — prior turns are included in the answer prompt (capped at `MAX_HISTORY_TURNS`).
+- **In-memory TTL cache** — repeat questions are served instantly.
+- **Per-stage timings** — every response includes `{router_ms, search_ms, rewrite_ms, fetch_ms, factsheet_ms, answer_ms, total_ms}`.
+- **`/health` endpoint** — reports LM Studio reachability and uptime.
+- **52 automated tests** — unit, integration, and async e2e tests; no real LLM or network needed.
 
-## Pipeline architecture
+---
 
-Every `/chat` request flows through a configurable pipeline:
+## How it works
+
+Every `/chat` request runs through a configurable pipeline:
 
 ```text
 user question
     │
     ▼
-┌─────────────┐ trivial? (greeting, "ok", < 4 chars)
-│ Fast-path   │──────────────► offline answer
+┌─────────────┐  greeting / len < 4?
+│  Fast-path  │──────────────────────► offline answer  (1 LLM call)
 └─────────────┘
-    │ otherwise
+    │ real question
     ▼
-┌─────────────┐ temperature=0.0, max_tokens=80
-│ Router LLM  │ returns {"need_search": bool, "query": "..."}
+┌─────────────┐  T=0.0, max_tokens=80
+│ Router LLM  │  → {"need_search": bool, "query": "..."}
 └─────────────┘
-    │ need_search=false ──────► offline answer
+    │ need_search=false ────────────► offline answer   (1 LLM call)
     │ need_search=true
     ▼
-┌─────────────┐ DuckDuckGo + tenacity retry (2 attempts, 0.5s backoff)
-│ Search      │ k = SEARCH_MAX_RESULTS
+┌─────────────┐  DuckDuckGo, tenacity retry (×2, 0.5 s backoff)
+│   Search    │  k = SEARCH_MAX_RESULTS
 └─────────────┘
     │
     ▼
-┌─────────────┐ if len(results) < 2 and ENABLE_QUERY_REWRITE
-│ Rewrite LLM │ rewrite query with REWRITE_SYSTEM prompt, re-search
+┌─────────────┐  only when len(results) < 2 and ENABLE_QUERY_REWRITE
+│ Rewrite LLM │  produces a better keyword query → re-runs search
 └─────────────┘
     │
     ▼
-┌─────────────┐ if ENABLE_PAGE_FETCH
-│ Enrich      │ fetch top PAGE_FETCH_TOP_K URLs in parallel,
-│             │ extract article text with trafilatura (5s timeout)
+┌─────────────┐  only when ENABLE_PAGE_FETCH
+│   Enrich    │  fetches top PAGE_FETCH_TOP_K URLs in parallel (trafilatura)
 └─────────────┘
     │
     ▼
-┌─────────────┐ if ENABLE_FACTSHEET (two-stage answer)
-│ Factsheet   │ LLM extracts "- [n] fact" bullets with temperature=0.1
-│ LLM         │
+┌─────────────┐  only when ENABLE_FACTSHEET
+│ Factsheet   │  T=0.1 → "- [n] <atomic fact>" bullet list
+│    LLM      │
 └─────────────┘
     │
     ▼
-┌─────────────┐ temperature=0.2, top_p=0.9, max_tokens=800
-│ Answer LLM  │ uses ANSWER_SYSTEM_GROUNDED + factsheet OR sources
+┌─────────────┐  T=0.2, top_p=0.9, max_tokens=800
+│ Answer LLM  │  uses ANSWER_SYSTEM_GROUNDED + factsheet (or raw sources)
 └─────────────┘
     │
     ▼
-response: {answer, sources, searched, query, cached, timings}
+{answer, sources, searched, query, cached, timings}
 ```
 
-### Stage details
+### Pipeline stage reference
 
-| Stage | When it runs | Prompt | Sampling |
+| Stage | Runs when | Prompt | Sampling |
 |---|---|---|---|
-| **Fast-path** | Greetings, short messages | — | — |
-| **Router** | Non-trivial questions, `force_search=false` | `ROUTER_SYSTEM` | `T=0.0`, `max_tokens=80` |
-| **Search** | `need_search=true` | — | — |
-| **Query rewrite** | `<2` results and `ENABLE_QUERY_REWRITE` | `REWRITE_SYSTEM` | `T=0.2`, `max_tokens=30` |
-| **Enrich** | `ENABLE_PAGE_FETCH` and sources present | — | — |
-| **Factsheet** | `ENABLE_FACTSHEET` and sources present | `FACTSHEET_SYSTEM` | `T=0.1`, `top_p=0.9`, `max_tokens=600` |
-| **Answer (grounded)** | Sources present | `ANSWER_SYSTEM_GROUNDED` | `T=0.2`, `top_p=0.9`, `max_tokens=800` |
-| **Answer (offline)** | No sources / router said no | `ANSWER_SYSTEM_OFFLINE` | `T=0.4`, `top_p=0.9`, `max_tokens=600` |
+| Fast-path | Greeting / message < 4 chars | — | — |
+| Router | Non-trivial, `force_search=false` | `ROUTER_SYSTEM` | `T=0.0`, `max_tokens=80` |
+| Search | `need_search=true` | — | — |
+| Query rewrite | < 2 results + `ENABLE_QUERY_REWRITE` | `REWRITE_SYSTEM` | `T=0.2`, `max_tokens=30` |
+| Enrich | `ENABLE_PAGE_FETCH` + sources present | — | — |
+| Factsheet | `ENABLE_FACTSHEET` + sources present | `FACTSHEET_SYSTEM` | `T=0.1`, `top_p=0.9`, `max_tokens=600` |
+| Answer (grounded) | Sources present | `ANSWER_SYSTEM_GROUNDED` | `T=0.2`, `top_p=0.9`, `max_tokens=800` |
+| Answer (offline) | No sources | `ANSWER_SYSTEM_OFFLINE` | `T=0.4`, `top_p=0.9`, `max_tokens=600` |
 
-### Prompts
+All prompts are in `app/prompts.py` and can be edited without changing any application logic.
 
-All prompts live in `app/prompts.py`:
-
-- **`ROUTER_SYSTEM`** — strict binary router; returns JSON only; 5 worked in/out examples.
-- **`REWRITE_SYSTEM`** — rewrites a failing query into keyword-phrased, time-bounded form.
-- **`FACTSHEET_SYSTEM`** — extracts one `[n]` bullet per fact from search results. Used as first stage of two-stage answer.
-- **`ANSWER_SYSTEM_GROUNDED`** — 9 explicit rules: cite immediately after each claim, never cite missing numbers, copy numbers verbatim, refuse when context is missing.
-- **`ANSWER_SYSTEM_OFFLINE`** — answers from general knowledge; explicit refusal phrase for time-sensitive questions.
-
-The assistant history is trimmed to the last `MAX_HISTORY_TURNS` exchanges, and `[n]` citation markers are stripped from prior assistant turns so old numbers don't leak into new answers.
+---
 
 ## Project structure
 
 ```text
 local-perplexity-starter/
-├── .env.example
+├── .env.example                   # All configuration knobs with defaults
+├── pytest.ini                     # asyncio_mode=auto, e2e marker
 ├── requirements.txt
 ├── app/
-│   ├── config.py       # Settings loaded from .env
-│   ├── main.py         # FastAPI app + pipeline orchestration
-│   ├── prompts.py      # Prompt templates + message builders
-│   ├── search.py       # DuckDuckGo wrapper with retry
-│   └── fetch.py        # Full-page extraction (httpx + trafilatura)
+│   ├── config.py                  # Settings loaded from .env
+│   ├── main.py                    # FastAPI app + pipeline orchestration
+│   ├── prompts.py                 # System prompts + message builders
+│   ├── search.py                  # DuckDuckGo wrapper with tenacity retry
+│   └── fetch.py                   # Parallel page extraction (httpx + trafilatura)
 ├── templates/
-│   └── index.html      # Single-page web UI
+│   └── index.html                 # Single-page dark-themed web UI
 └── tests/
-    ├── test_prompts.py
-    ├── test_main_helpers.py
-    ├── test_search.py
-    ├── test_fetch.py
-    └── test_chat_integration.py
+    ├── test_prompts.py            # Unit: prompt builders, source formatting, history trimming
+    ├── test_main_helpers.py       # Unit: router JSON parsing, fast-path, cache key
+    ├── test_search.py             # Unit: dedup, error handling, tenacity retry
+    ├── test_fetch.py              # Unit: trafilatura fallback, empty-body handling
+    ├── test_chat_integration.py   # Integration: full /chat pipeline via TestClient
+    └── e2e/
+        ├── conftest.py            # Async ASGI fixture with StubLLM + shared holder
+        └── test_e2e.py            # E2E: 19 async tests over real HTTP stack
 ```
+
+---
 
 ## Prerequisites
 
 - Python 3.11+
-- [LM Studio](https://lmstudio.ai/) with a model downloaded and Local Server running
+- [`uv`](https://github.com/astral-sh/uv) (recommended) — or plain `pip`
+- [LM Studio](https://lmstudio.ai/) with a model downloaded and the **Local Server** running
   (tested with **Gemma 4 e2b**; any instruction-following model works)
+
+---
 
 ## Setup
 
 ### 1. Start LM Studio
 
-1. Open LM Studio and download a model.
-2. Go to the **Developer** (or **Local Server**) tab.
-3. Click **Start Server**.
-4. Confirm the server is available at `http://localhost:1234/v1`.
+1. Open LM Studio and download a model (e.g. Gemma 4 e2b, Llama-3.2-3B, Phi-3-mini).
+2. Go to the **Developer** → **Local Server** tab and click **Start Server**.
+3. Confirm the server responds at `http://localhost:1234/v1`. If your port differs, set `LM_STUDIO_BASE_URL` in `.env`.
 
-### 2. Install dependencies
+### 2. Create a virtual environment and install dependencies
 
-**Linux / macOS:**
+**Using uv (recommended):**
+```bash
+uv venv .venv
+source .venv/bin/activate        # Linux / macOS
+# .venv\Scripts\activate         # Windows PowerShell
+uv pip install -r requirements.txt
+```
+
+**Using plain pip:**
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-**Windows (PowerShell):**
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -147,7 +158,8 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` to taste. See the **Configuration reference** table below for every knob.
+The defaults work out of the box for a standard LM Studio setup. Edit `.env` if your port, model, or language differs.
+See the [Configuration reference](#configuration-reference) table for every available knob.
 
 ### 4. Run the server
 
@@ -155,43 +167,41 @@ Edit `.env` to taste. See the **Configuration reference** table below for every 
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000` in your browser.
+Open **http://127.0.0.1:8000** in your browser.
+
+---
 
 ## Usage
 
 ### Web UI
 
-Type a question and press **Ask** or Enter. Check **Always search the web** to bypass the router and force a web search.
+Type a question and press **Ask** (or Enter). Tick **Always search the web** to bypass the router and force a live
+DuckDuckGo search regardless of the question type.
 
 ### REST API
 
 #### `POST /chat`
 
-Request body:
+**Request body:**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `message` | string | yes | The user's question |
-| `force_search` | boolean | no | Skip the router and always run a web search (default: `false`) |
-| `history` | array | no | Prior `{role, content}` turns to include as conversation context |
+| `force_search` | boolean | no | Skip the router, always search (default: `false`) |
+| `history` | array | no | Prior `{role, content}` turns for multi-turn context |
 
-Response body:
+**Response body:**
 
 | Field | Type | Description |
 |---|---|---|
-| `answer` | string | LLM-generated answer, may contain `[n]` citation markers |
-| `sources` | array | `[{title, url, snippet}]` used as context |
+| `answer` | string | LLM-generated answer; may contain `[n]` citation markers |
+| `sources` | array | `[{title, url, snippet}]` objects used as context |
 | `searched` | boolean | Whether a web search was performed |
-| `query` | string \| null | The search query actually used, or `null` |
-| `cached` | boolean | `true` if this response was served from the in-memory cache |
-| `timings` | object | `{router_ms, search_ms, rewrite_ms, fetch_ms, factsheet_ms, answer_ms, total_ms}` |
+| `query` | string \| null | The query sent to DuckDuckGo, or `null` |
+| `cached` | boolean | `true` when served from the in-memory cache |
+| `timings` | object | Per-stage milliseconds (see example below) |
 
-#### `GET /health`
-
-Returns `{status, model, lm_studio_reachable, uptime_seconds}`.
-Useful for container liveness probes.
-
-#### Example — automatic web search
+**Example — question that triggers a web search:**
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/chat \
@@ -202,7 +212,9 @@ curl -s -X POST http://127.0.0.1:8000/chat \
 ```json
 {
   "answer": "The latest stable Python release is **Python 3.14** [1].",
-  "sources": [{"title": "Python downloads", "url": "https://python.org/downloads", "snippet": "..."}],
+  "sources": [
+    {"title": "Python downloads", "url": "https://python.org/downloads", "snippet": "..."}
+  ],
   "searched": true,
   "query": "latest Python stable version",
   "cached": false,
@@ -218,13 +230,165 @@ curl -s -X POST http://127.0.0.1:8000/chat \
 }
 ```
 
+**Example — multi-turn conversation:**
+
+```bash
+# Second turn includes history from the first
+curl -s -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Is it faster than Python 3.12?",
+    "history": [
+      {"role": "user",      "content": "What is the latest Python version?"},
+      {"role": "assistant", "content": "Python 3.14 [1]."}
+    ]
+  }'
+```
+
+#### `GET /health`
+
+```json
+{
+  "status": "ok",
+  "model": "gemma-4-e2b",
+  "lm_studio_reachable": true,
+  "uptime_seconds": 142
+}
+```
+
+Returns `"status": "degraded"` when LM Studio is unreachable. Suitable for container liveness probes.
+
+---
+
+## Testing
+
+The project has **52 tests** in three layers, none of which make real network calls or require LM Studio to be running.
+
+### Install test dependencies
+
+```bash
+uv pip install pytest pytest-asyncio
+```
+
+### Run all tests
+
+```bash
+pytest tests/ -v
+```
+
+Expected output: **52 passed in ~2 s**.
+
+---
+
+### Layer 1 — Unit tests (`tests/test_*.py`)
+
+Pure function tests with no I/O.
+
+```bash
+pytest tests/ --ignore=tests/e2e -v
+```
+
+| File | What is tested |
+|---|---|
+| `test_prompts.py` | Prompt builders, source formatting (content vs snippet, trimming), history trimming, citation stripping |
+| `test_main_helpers.py` | Router JSON parsing (plain, markdown-fenced, noisy, invalid), `_is_trivial`, `_cache_key` |
+| `test_search.py` | Result normalisation, URL deduplication, exception swallowing, tenacity retry path |
+| `test_fetch.py` | Parallel page extraction, `trafilatura`-unavailable fallback, empty-body skip |
+
+---
+
+### Layer 2 — Integration tests (`tests/test_chat_integration.py`)
+
+Full `/chat` and `/health` routes via FastAPI's `TestClient`. LLM and search are replaced with
+a script-driven `StubLLM` and a mocked `run_search`.
+
+```bash
+pytest tests/test_chat_integration.py -v
+```
+
+Covers: fast-path, router→no-search, router→search, `force_search`, cache hit, empty input (400).
+
+---
+
+### Layer 3 — End-to-end tests (`tests/e2e/`)
+
+Async tests that send real HTTP requests to the running ASGI app through
+`httpx.AsyncClient(transport=ASGITransport(app))`. The only stubs are at the true external
+boundaries: `openai.OpenAI` and `run_search`. Every middleware, route, Pydantic model,
+prompt builder, cache, and timing path runs as-is.
+
+```bash
+# Run only e2e tests
+pytest tests/e2e/ -v
+
+# Run e2e tests by marker
+pytest -m e2e -v
+```
+
+#### How the fixture works
+
+`tests/e2e/conftest.py` provides a single `e2e` async fixture that:
+
+1. **Patches `openai.OpenAI`** before the FastAPI lifespan starts, so `app.state.client` is a `StubLLM`.
+2. `StubLLM` holds a **reference** to a shared `holder` dict — not a copy — so calling `e2e.configure(llm=[...])` in a test updates the responses seen by the already-running client.
+3. **Patches `run_search`** with a lambda that reads from the same holder.
+4. **Disables all optional stages** (`page_fetch`, `factsheet`, `query_rewrite`) by default — individual tests opt-in via `monkeypatch.setattr(settings, ...)`.
+5. Boots the app via `httpx.ASGITransport` and the FastAPI lifespan context manager.
+
+Each test calls `e2e.configure(llm=[...], search=[...])` before making requests to set the scripted responses for that scenario.
+
+#### E2E test coverage
+
+| Test | Scenario |
+|---|---|
+| `test_health_ok` | `/health` returns model name and `lm_studio_reachable=true` |
+| `test_fastpath_greeting_skips_router` | "hi" → 1 LLM call, `router_ms==0` |
+| `test_fastpath_thanks` | "thanks" → fast-path triggered |
+| `test_no_search_path` | Router returns `need_search=false` → 2 LLM calls, no sources |
+| `test_search_path_sources_returned` | Router returns `need_search=true` → sources in response |
+| `test_force_search_skips_router` | `force_search=true` → `router_ms==0`, message used as query |
+| `test_factsheet_stage_runs` | `ENABLE_FACTSHEET=true` → 3 LLM calls, `factsheet_ms` recorded |
+| `test_query_rewrite_fires_on_scarce_results` | < 2 results → rewrite LLM fires, second search attempt |
+| `test_history_citations_stripped` | `[n]` markers removed from prior assistant turns |
+| `test_history_user_content_preserved` | Prior user turns forwarded verbatim |
+| `test_cache_hit_returns_cached_flag` | Repeat request → `cached=true`, no new LLM calls |
+| `test_cache_differentiates_force_search` | `force_search=true/false` have separate cache keys |
+| `test_router_uses_temperature_zero` | Router call: `T=0.0`; answer call: `T>0.0` |
+| `test_router_max_tokens_is_80` | Router: `max_tokens=80`; offline answer: `max_tokens=600` |
+| `test_empty_message_returns_400` | Blank input → HTTP 400 |
+| `test_missing_message_field_returns_422` | Missing `message` field → HTTP 422 |
+| `test_llm_answer_failure_returns_502` | Answer stage exception → HTTP 502 |
+| `test_timings_present_and_non_negative` | All 7 timing fields present and ≥ 0 |
+| `test_timings_total_includes_all_stages` | `total_ms ≥ sum(stage_ms)` |
+
+#### Spy-patching `_llm_call` for contract tests
+
+Some tests verify _how_ the LLM is called, not just _what_ it returns. They patch `_llm_call`
+directly while still routing through the StubLLM for the actual response:
+
+```python
+orig = main_mod._llm_call
+
+def spy(messages, *, temperature=0.3, **kw):
+    calls.append({"temperature": temperature})
+    return orig(messages, temperature=temperature, **kw)
+
+with patch.object(main_mod, "_llm_call", side_effect=spy):
+    r = await e2e.http.post("/chat", json={"message": "Explain TCP"})
+
+assert calls[0]["temperature"] == 0.0   # router must be deterministic
+assert calls[1]["temperature"] > 0.0    # answer may be creative
+```
+
+---
+
 ## Configuration reference
 
 | Variable | Default | Description |
 |---|---|---|
-| `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | Base URL of the LM Studio local server |
-| `LM_STUDIO_API_KEY` | `lm-studio` | API key sent in requests (LM Studio ignores it) |
-| `LM_STUDIO_MODEL` | _(empty)_ | Model ID; auto-detects the first available model when blank |
+| `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | LM Studio local server base URL |
+| `LM_STUDIO_API_KEY` | `lm-studio` | Sent with every request; LM Studio ignores it |
+| `LM_STUDIO_MODEL` | _(empty)_ | Model ID; auto-detects the first loaded model when blank |
 | `APP_HOST` | `127.0.0.1` | FastAPI bind host |
 | `APP_PORT` | `8000` | FastAPI bind port |
 | `SEARCH_REGION` | `wt-wt` | DuckDuckGo region (`wt-wt` = worldwide) |
@@ -233,58 +397,50 @@ curl -s -X POST http://127.0.0.1:8000/chat \
 | `SEARCH_BACKEND` | `html` | DuckDuckGo backend: `html` (stable) or `lite` |
 | `SYSTEM_LANGUAGE` | `en` | Response language: `en`, `uk`, `de`, `fr`, `pl`, `ru` |
 | `LLM_TIMEOUT` | `60` | Seconds before an LLM call times out |
-| `LLM_RETRIES` | `1` | Extra attempts on LLM failure (total = retries + 1) |
-| `ENABLE_FACTSHEET` | `true` | Enable two-stage answer (factsheet then answer) |
-| `ENABLE_QUERY_REWRITE` | `true` | Retry with a rewritten query if <2 results |
-| `ENABLE_PAGE_FETCH` | `true` | Enrich top-K sources with full-page extraction |
-| `PAGE_FETCH_TOP_K` | `3` | Number of top sources to enrich |
-| `PAGE_FETCH_TIMEOUT` | `5` | Seconds per page fetch |
-| `MAX_HISTORY_TURNS` | `6` | Max prior exchanges included in answer prompt |
-| `CACHE_TTL` | `300` | TTL (seconds) for the answer cache |
+| `LLM_RETRIES` | `1` | Extra LLM attempts on failure (total = retries + 1) |
+| `ENABLE_FACTSHEET` | `true` | Two-stage answer (factsheet extraction then final answer) |
+| `ENABLE_QUERY_REWRITE` | `true` | Rewrite and re-search when < 2 results returned |
+| `ENABLE_PAGE_FETCH` | `true` | Enrich top-K sources with full article text |
+| `PAGE_FETCH_TOP_K` | `3` | Number of URLs to enrich |
+| `PAGE_FETCH_TIMEOUT` | `5` | Per-URL fetch timeout in seconds |
+| `MAX_HISTORY_TURNS` | `6` | Prior exchanges included in the answer prompt |
+| `CACHE_TTL` | `300` | Answer cache TTL in seconds |
 | `CACHE_SIZE` | `128` | Max entries in the answer cache |
 
-## Testing
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-The suite (33 tests, ~1.5 s) covers:
-
-- Prompt builders and helper functions
-- Router JSON parsing (plain, fenced, noisy, invalid)
-- Fast-path detection and cache key derivation
-- Search normalization, deduplication, and retry behaviour
-- Page-fetch fallback when `trafilatura` is unavailable
-- End-to-end `/chat` flow for all pipeline branches (fast-path, router-no-search, router-triggers-search, force_search, cache hit) with a stubbed LLM
-
-No real LLM or network is hit during tests.
+---
 
 ## Troubleshooting
 
-**`503 LLM client not initialised` or `No models found`**
-LM Studio is not running or no model is loaded.
+**`503 LLM client not initialised` / `No models found`**
+LM Studio is not running or no model is loaded. Start the server and load a model first.
 
 **DuckDuckGo returns few or no results**
-Leave `ENABLE_QUERY_REWRITE=true` — the pipeline will rewrite and retry automatically. If that still fails, try `SEARCH_BACKEND=lite` or raise `SEARCH_MAX_RESULTS`.
+The pipeline retries automatically when `ENABLE_QUERY_REWRITE=true`. If still scarce, try
+`SEARCH_BACKEND=lite` or increase `SEARCH_MAX_RESULTS`.
 
-**Router always (or never) searches**
-Adjust `ROUTER_SYSTEM` in `app/prompts.py` or send `force_search=true` in the request.
+**Router always (or never) triggers a search**
+Edit `ROUTER_SYSTEM` in `app/prompts.py`, or bypass the router entirely with `force_search=true`.
 
-**Answer quality is poor on a small model**
-Lower `temperature` in `app/main.py` (currently `0.2` for grounded answers). Ensure `ENABLE_FACTSHEET=true` — the two-stage split is specifically designed to keep small models faithful to sources.
+**Answer quality is poor**
+Ensure `ENABLE_FACTSHEET=true` — the two-stage split significantly improves faithfulness on small
+models. Also try reducing `temperature` in `app/main.py` (current: `0.2` for grounded answers).
 
-**Answers are too slow**
-Inspect the per-stage `timings` in the response. The usual suspects are:
-- `fetch_ms` high → reduce `PAGE_FETCH_TOP_K` or disable `ENABLE_PAGE_FETCH`.
-- `factsheet_ms` high → disable `ENABLE_FACTSHEET`.
-- `answer_ms` high → lower `max_tokens` in `_llm_call` or use a smaller model.
+**Answers are slow**
+Inspect the `timings` object in the response to find the bottleneck:
+- High `fetch_ms` → lower `PAGE_FETCH_TOP_K` or set `ENABLE_PAGE_FETCH=false`.
+- High `factsheet_ms` → set `ENABLE_FACTSHEET=false`.
+- High `answer_ms` → use a smaller model or lower `max_tokens` in `app/main.py`.
+
+**Tests fail after editing pipeline code**
+Run `pytest tests/ -v` to confirm all 52 tests pass before committing. The e2e suite
+(`pytest -m e2e`) gives the most complete coverage of the full HTTP stack.
+
+---
 
 ## Extending the project
 
-1. **Streaming** — stream the answer via SSE or WebSocket.
-2. **Reranking** — cross-encoder (e.g. `bge-reranker-base`) between search and enrich.
-3. **News mode** — separate `DDGS().news(...)` path for time-sensitive queries.
-4. **Dockerfile** — containerize the app (LM Studio stays on the host).
-5. **Persistent chat history** — SQLite + session IDs.
+1. **Streaming** — stream answer tokens via SSE using `stream=True` from the OpenAI client.
+2. **Reranking** — insert a cross-encoder (e.g. `bge-reranker-base`) between Search and Enrich.
+3. **News mode** — add a `DDGS().news(...)` path for time-sensitive queries.
+4. **Dockerfile** — containerise the app; LM Studio stays on the host via `host.docker.internal`.
+5. **Persistent history** — SQLite + session IDs for stateful multi-turn conversations.
